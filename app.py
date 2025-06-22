@@ -309,74 +309,7 @@ def extract_hls():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/info', methods=['POST'])
-def get_video_info():
-    """Obtiene información completa del video (incluyendo pCloud)"""
-    try:
-        data = request.json
-        url = data.get('url')
-        
-        # Opciones de autenticación  
-        cookies_file = data.get('cookies_file')
-        cookies_dict = data.get('cookies')
-        headers = data.get('headers')
-        cookies_content = data.get('cookies_content')
-        
-        if not url:
-            return jsonify({'error': 'URL is required'}), 400
-        
-        extractor = YTDLPExtractor()
-        temp_cookies_file = None
-        
-        try:
-            if cookies_content:
-                temp_file = f"uploaded_cookies_{int(time.time())}.txt"
-                temp_cookies_file = extractor.save_cookies_file(cookies_content, temp_file)
-                cookies_file = temp_cookies_file
-            
-            info = extractor.extract_info(url, cookies_file=cookies_file, cookies_dict=cookies_dict, headers=headers)
-        
-            # Información básica
-            basic_info = {
-                'title': info.get('title'),
-                'description': info.get('description'),
-                'duration': info.get('duration'),
-                'uploader': info.get('uploader'),
-                'upload_date': info.get('upload_date'),
-                'view_count': info.get('view_count'),
-                'like_count': info.get('like_count'),
-                'thumbnail': info.get('thumbnail'),
-                'webpage_url': info.get('webpage_url'),
-                'formats_count': len(info.get('formats', [])),
-                'filesize': info.get('filesize'),
-                'source': info.get('source', 'yt-dlp')
-            }
-            
-            # Contar formatos por protocolo
-            protocols = {}
-            if 'formats' in info:
-                for fmt in info['formats']:
-                    protocol = fmt.get('protocol', 'unknown')
-                    protocols[protocol] = protocols.get(protocol, 0) + 1
-            
-            # Detectar si es pCloud
-            is_pcloud = extractor.is_pcloud_link(url)
-            
-            return jsonify({
-                'success': True,
-                'info': basic_info,
-                'protocols_available': protocols,
-                'used_cookies': bool(cookies_file or cookies_dict),
-                'used_headers': bool(headers),
-                'is_pcloud': is_pcloud
-            })
-        
-        finally:
-            if temp_cookies_file and os.path.exists(temp_cookies_file):
-                os.remove(temp_cookies_file)
     
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 
 @app.route('/formats', methods=['POST'])
 def get_all_formats():
@@ -548,36 +481,17 @@ def list_cookies():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/supported-sites', methods=['GET'])
-def get_supported_sites():
-    """Lista sitios soportados (incluyendo pCloud)"""
-    try:
-        extractor = YTDLPExtractor()
-        sites = extractor.get_supported_sites()
-        
-        return jsonify({
-            'success': True,
-            'supported_sites_count': len(sites),
-            'supported_sites': sites[:50],  # Primeros 50 para no sobrecargar
-            'pcloud_supported': True
-        })
-    
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({
         'message': 'yt-dlp HLS Extractor API with Cookies Support + pCloud',
         'endpoints': {
             'POST /extract': 'Extract HLS URLs from video (supports pCloud)',
-            'POST /info': 'Get video information (supports pCloud)',
             'POST /formats': 'Get all available formats (supports pCloud)',
             'POST /download': 'Download video (not supported for pCloud)',
             'POST /upload-cookies': 'Upload cookies file',
             'GET /cookies': 'List uploaded cookies files',
             'DELETE /cookies/<id>': 'Delete cookies file',
-            'GET /supported-sites': 'List supported sites'
         },
         'supported_sources': [
             'All yt-dlp supported sites (YouTube, Vimeo, etc.)',
