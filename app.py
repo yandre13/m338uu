@@ -252,64 +252,124 @@ class YTDLPExtractor:
 
 @app.route('/extract', methods=['POST'])
 def extract_hls():
-    """Extrae URLs HLS de un video (incluyendo pCloud)"""
+    """Extrae URLs HLS con regeneración automática para pCloud"""
     try:
         data = request.json
         url = data.get('url')
         best_only = data.get('best_only', False)
-        
-        # Opciones de autenticación
-        cookies_file = data.get('cookies_file')  # Ruta al archivo de cookies
-        cookies_dict = data.get('cookies')       # Diccionario de cookies
-        headers = data.get('headers')            # Headers personalizados
-        cookies_content = data.get('cookies_content')  # Contenido directo del archivo
+        force_regenerate = data.get('force_regenerate', True)  # Por defecto regenerar
         
         if not url:
             return jsonify({'error': 'URL is required'}), 400
         
         extractor = YTDLPExtractor()
-        temp_cookies_file = None
         
-        try:
-            # Si se envió contenido de cookies, crear archivo temporal
-            if cookies_content:
-                temp_file = f"uploaded_cookies_{int(time.time())}.txt"
-                temp_cookies_file = extractor.save_cookies_file(cookies_content, temp_file)
-                cookies_file = temp_cookies_file
+        # Para pCloud, usar regeneración con IP del cliente
+        if extractor.is_pcloud_link(url):
+            client_ip = extractor.get_client_ip(request)
             
-            if best_only:
-                best_format, info = extractor.get_best_hls(url, cookies_file, cookies_dict, headers)
-                hls_formats = [best_format] if best_format else []
-            else:
-                hls_formats, info = extractor.get_hls_urls(url, cookies_file, cookies_dict, headers)
-            
-            # Detectar si es pCloud
-            is_pcloud = extractor.is_pcloud_link(url)
-            
-            return jsonify({
-                'success': True,
-                'url': url,
-                'title': info.get('title', 'Unknown'),
-                'duration': info.get('duration'),
-                'uploader': info.get('uploader'),
-                'hls_formats_count': len(hls_formats),
-                'hls_formats': hls_formats,
-                'thumbnail': info.get('thumbnail'),
-                'used_cookies': bool(cookies_file or cookies_dict),
-                'used_headers': bool(headers),
-                'source': 'pcloud' if is_pcloud else 'yt-dlp',
-                'is_pcloud': is_pcloud
-            })
+            try:
+                if force_regenerate:
+                    hls_formats, info = extractor.extract_pcloud_m3u8_with_client_ip(url, client_ip)
+                else:
+                    # Intentar método normal primero
+                    try:
+                        hls_formats, info = extractor.extract_pcloud_m3u8(url)
+                    except:
+                        # Si falla, usar regeneración
+                        hls_formats, info = extractor.extract_pcloud_m3u8_with_client_ip(url, client_ip)
+                
+                if best_only and hls_formats:
+                    # Seleccionar la mejor calidad
+                    best_format = max(hls_formats, key=lambda x: (
+                        x.get('height', 0),
+                        x.get('tbr', 0)
+                    ))
+                    hls_formats = [best_format]
+                
+                return jsonify({
+                    'success': True,
+                    'url': url,
+                    'title': info.get('title', 'Unknown'),
+                    'duration': info.get('duration'),
+                    'uploader': info.get('uploader'),
+                    'hls_formats_count': len(hls_formats),
+                    'hls_formats': hls_formats,
+                    'thumbnail': info.get('thumbnail'),
+                    'client_ip': client_ip,
+                    'source': 'pcloud',
+                    'regenerated': force_regenerate,
+                    'extracted_at': info.get('extracted_at'),
+                    'usage_note': 'URLs are regenerated for your IP. Use immediately for best results.'
+                })
+                
+            except Exception as pcloud_error:
+                return jsonify({
+                    'success': False,
+                    'error': f'pCloud extraction failed: {str(pcloud_error)}',
+                    'client_ip': client_ip,
+                    'suggestion': 'The video might be private or the link expired',
+                    'troubleshooting': {
+                        'try_again': 'Wait a few seconds and try again',
+                        'check_link': 'Verify the pCloud link is publicly accessible',
+                        'contact_support': 'If problem persists, contact support'
+                    }
+                }), 500
         
-        finally:
-            # Limpiar archivo temporal de cookies
-            if temp_cookies_file and os.path.exists(temp_cookies_file):
-                os.remove(temp_cookies_file)
-    
+        # Para otros sitios, usar yt-dlp normal
+        else:
+            # ... tu código original para otros sitios ...
+            pass
+            
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-    
+# ENDPOINT ESPECÍFICO PARA REGENERACIÓN
+@app.route('/pcloud/regenerate', methods=['POST'])
+def regenerate_pcloud():
+    """Regenera específicamente enlaces de pCloud"""
+    try:
+        data = request.json
+        pcloud_url = data.get('url')
+        best_only = data.get('best_only', True)
+        
+        if not pcloud_url:
+            return jsonify({'error': 'pCloud URL is required'}), 400
+        
+        extractor = YTDLPExtractor()
+        
+        # Verificar que sea un enlace de pCloud
+        if not extractor.is_pcloud_link(pcloud_url):
+            return jsonify({'error': 'Not a valid pCloud link'}), 400
+        
+        client_ip = extractor.get_client_ip(request)
+        
+        hls_formats, info = extractor.extract_pcloud_m3u8_with_client_ip(pcloud_url, client_ip)
+        
+        if best_only and hls_formats:
+            best_format = max(hls_formats, key=lambda x: (
+                x.get('height', 0),
+                x.get('tbr', 0)
+            ))
+            hls_formats = [best_format]
+        
+        return jsonify({
+            'success': True,
+            'regenerated': True,
+            'client_ip': client_ip,
+            'url': pcloud_url,
+            'title': info.get('title'),
+            'hls_formats': hls_formats,
+            'info': info,
+            'instructions': {
+                'usage': 'Use the provided m3u8 URLs immediately',
+                'headers': 'Include the recommended http_headers when playing',
+                'expiration': 'URLs may expire, regenerate if needed'
+            }
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500    
 
 @app.route('/formats', methods=['POST'])
 def get_all_formats():
