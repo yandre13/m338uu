@@ -4,11 +4,10 @@ import yt_dlp
 import json
 import re
 import requests
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 import tempfile
 import os
 import time
-import hashlib
 
 app = Flask(__name__)
 CORS(app)
@@ -19,80 +18,47 @@ class YTDLPExtractor:
             'quiet': True,
             'no_warnings': True,
             'extract_flat': False,
-            'skip_download': True,
+            'skip_download': True,  # Solo extraer info, no descargar
         }
+        # Directorios compatibles con Docker
         self.cookies_dir = os.path.join('/app', 'cookies')
         self.downloads_dir = os.path.join('/app', 'downloads')
         
+        # Crear directorios si no existen
         os.makedirs(self.cookies_dir, exist_ok=True)
         os.makedirs(self.downloads_dir, exist_ok=True)
     
     def is_pcloud_link(self, url):
         """Detecta si es un enlace de pCloud"""
-        return "u.pcloud.link/publink/show" in url or "pcloud.link" in url
+        return "u.pcloud.link/publink/show" in url
     
-    def get_client_ip(self, request_obj):
-        """Obtiene la IP del cliente que hace la petición"""
-        # Intenta obtener la IP real considerando proxies/load balancers
-        if request_obj.headers.getlist("X-Forwarded-For"):
-            ip = request_obj.headers.getlist("X-Forwarded-For")[0].split(',')[0].strip()
-        elif request_obj.headers.get('X-Real-IP'):
-            ip = request_obj.headers.get('X-Real-IP')
-        elif request_obj.headers.get('CF-Connecting-IP'):  # Cloudflare
-            ip = request_obj.headers.get('CF-Connecting-IP')
-        else:
-            ip = request_obj.remote_addr
-        return ip
-    
-    def extract_pcloud_m3u8_with_proxy(self, pcloud_url, client_ip=None, user_agent=None):
-        """
-        OPCIÓN 1: Usar la IP del cliente para hacer la petición
-        Solo consume bandwidth para obtener el HTML (muy poco)
-        """
+    def extract_pcloud_m3u8(self, pcloud_url):
+        """Extrae la URL del m3u8 desde pCloud"""
         try:
+            # 1. Hacer request al enlace de pCloud
             headers = {
-                'User-Agent': user_agent or 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                 'Accept-Language': 'en-US,en;q=0.5',
                 'Accept-Encoding': 'gzip, deflate, br',
                 'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1',
-                'Referer': 'https://pcloud.com/',
+                'Upgrade-Insecure-Requests': '1'
             }
             
-            # Si tenemos la IP del cliente, añadirla como X-Forwarded-For
-            if client_ip:
-                headers['X-Forwarded-For'] = client_ip
-                headers['X-Real-IP'] = client_ip
-            
-            # Solo descargamos el HTML (pocos KB)
-            response = requests.get(pcloud_url, headers=headers, timeout=15)
+            response = requests.get(pcloud_url, headers=headers, timeout=30)
             response.raise_for_status()
             
-            # Extraer JSON con mínimo procesamiento
+            # 2. Extraer el JSON con la info del video
             json_pattern = r'var publinkData = ({.*?});'
             json_match = re.search(json_pattern, response.text, re.DOTALL)
             
             if not json_match:
-                # OPCIÓN 2: Intentar con diferentes patrones si falla
-                alt_patterns = [
-                    r'publinkData\s*=\s*({.*?});',
-                    r'"publinkData":\s*({.*?})',
-                    r'window\.publinkData\s*=\s*({.*?});'
-                ]
-                
-                for pattern in alt_patterns:
-                    match = re.search(pattern, response.text, re.DOTALL)
-                    if match:
-                        json_match = match
-                        break
-                
-                if not json_match:
-                    raise Exception("No se pudo extraer publinkData. Posible cambio en pCloud.")
+                raise Exception("No se pudo extraer publinkData del HTML")
             
+            # 3. Parsear el JSON
             data = json.loads(json_match.group(1))
             
-            # Procesar variantes HLS
+            # 4. Buscar la variante HLS (m3u8)
             variants = data.get('variants', [])
             hls_formats = []
             
@@ -102,52 +68,30 @@ class YTDLPExtractor:
                     hosts = variant.get('hosts', [])
                     
                     if hosts:
-                        host = hosts[0]
+                        host = hosts[0]  # Tomar el primer host
                         m3u8_url = f"https://{host}{path}"
                         
-                        # Validar que la URL sea accesible (HEAD request - mínimo bandwidth)
-                        try:
-                            head_response = requests.head(m3u8_url, timeout=5, headers={'User-Agent': headers['User-Agent']})
-                            if head_response.status_code == 200:
-                                hls_format = {
-                                    'format_id': f"pcloud_hls_{variant.get('id', 'unknown')}",
-                                    'url': m3u8_url,
-                                    'ext': 'm3u8',
-                                    'protocol': 'm3u8_native',
-                                    'height': variant.get('height'),
-                                    'width': variant.get('width'),
-                                    'fps': variant.get('fps'),
-                                    'tbr': variant.get('bitrate'),
-                                    'format_note': f"pCloud HLS {variant.get('height', 'unknown')}p",
-                                    'expires': variant.get('expires'),
-                                    'host': host,
-                                    'source': 'pcloud',
-                                    'verified': True
-                                }
-                                hls_formats.append(hls_format)
-                        except:
-                            # Si falla la verificación, incluir de todas formas
-                            hls_format = {
-                                'format_id': f"pcloud_hls_{variant.get('id', 'unknown')}",
-                                'url': m3u8_url,
-                                'ext': 'm3u8',
-                                'protocol': 'm3u8_native',
-                                'height': variant.get('height'),
-                                'width': variant.get('width'),
-                                'fps': variant.get('fps'),
-                                'tbr': variant.get('bitrate'),
-                                'format_note': f"pCloud HLS {variant.get('height', 'unknown')}p",
-                                'expires': variant.get('expires'),
-                                'host': host,
-                                'source': 'pcloud',
-                                'verified': False,
-                                'warning': 'URL not verified - may require same IP'
-                            }
-                            hls_formats.append(hls_format)
+                        hls_format = {
+                            'format_id': f"pcloud_hls_{variant.get('id', 'unknown')}",
+                            'url': m3u8_url,
+                            'ext': 'm3u8',
+                            'protocol': 'm3u8_native',
+                            'height': variant.get('height'),
+                            'width': variant.get('width'),
+                            'fps': variant.get('fps'),
+                            'tbr': variant.get('bitrate'),
+                            'format_note': f"pCloud HLS {variant.get('height', 'unknown')}p",
+                            'referer': pcloud_url,
+                            'expires': variant.get('expires'),
+                            'host': host,
+                            'source': 'pcloud'
+                        }
+                        hls_formats.append(hls_format)
             
             if not hls_formats:
-                raise Exception("No se encontraron variantes HLS válidas")
+                raise Exception("No se encontraron variantes HLS en los datos de pCloud")
             
+            # Información básica del archivo
             basic_info = {
                 'title': data.get('name', 'pCloud Video'),
                 'duration': data.get('duration'),
@@ -155,87 +99,18 @@ class YTDLPExtractor:
                 'thumbnail': data.get('thumb1024', data.get('thumb', '')),
                 'uploader': 'pCloud',
                 'webpage_url': pcloud_url,
-                'source': 'pcloud',
-                'extracted_with_ip': client_ip,
-                'expires_info': 'URLs may expire and require same IP as extraction'
+                'source': 'pcloud'
             }
             
             return hls_formats, basic_info
             
         except requests.RequestException as e:
-            raise Exception(f"Error de red al acceder a pCloud: {str(e)}")
+            raise Exception(f"Error al acceder a pCloud: {str(e)}")
         except json.JSONDecodeError as e:
             raise Exception(f"Error al parsear JSON de pCloud: {str(e)}")
         except Exception as e:
             raise Exception(f"Error procesando pCloud: {str(e)}")
     
-    def extract_pcloud_direct_link_method(self, pcloud_url):
-        """
-        OPCIÓN 3: Método alternativo usando la API interna de pCloud
-        Consume aún menos bandwidth
-        """
-        try:
-            # Extraer code del URL
-            if '?code=' in pcloud_url:
-                code = pcloud_url.split('?code=')[1].split('&')[0]
-            else:
-                raise Exception("No se pudo extraer el código del enlace de pCloud")
-            
-            # Usar API interna de pCloud (menos bandwidth)
-            api_url = f"https://api.pcloud.com/getpubzip"
-            params = {
-                'code': code,
-                'forcedownload': 1,
-                'skipfilename': 1
-            }
-            
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Referer': 'https://pcloud.com/'
-            }
-            
-            # Solo petición de metadatos (muy poco bandwidth)
-            response = requests.get(api_url, params=params, headers=headers, timeout=10)
-            response.raise_for_status()
-            
-            data = response.json()
-            
-            if data.get('result') != 0:
-                raise Exception(f"Error de API de pCloud: {data.get('error', 'Unknown error')}")
-            
-            # Extraer información de archivos
-            files = data.get('metadata', {}).get('contents', [])
-            video_files = [f for f in files if f.get('contenttype', '').startswith('video/')]
-            
-            if not video_files:
-                raise Exception("No se encontraron archivos de video en el enlace de pCloud")
-            
-            # Tomar el primer archivo de video
-            video_file = video_files[0]
-            
-            # Construir URL de descarga directa
-            download_url = f"https://api.pcloud.com/getpublink?code={code}&linkid={video_file.get('id')}"
-            
-            return [{
-                'format_id': 'pcloud_direct',
-                'url': download_url,
-                'ext': video_file.get('name', '').split('.')[-1] if '.' in video_file.get('name', '') else 'mp4',
-                'filesize': video_file.get('size'),
-                'format_note': 'pCloud Direct Download',
-                'source': 'pcloud_api',
-                'warning': 'This is a direct download URL, not HLS'
-            }], {
-                'title': video_file.get('name', 'pCloud Video'),
-                'filesize': video_file.get('size'),
-                'uploader': 'pCloud',
-                'webpage_url': pcloud_url,
-                'source': 'pcloud_api'
-            }
-            
-        except Exception as e:
-            raise Exception(f"Error con API de pCloud: {str(e)}")
-    
-    # ... resto de métodos sin cambios ...
     def save_cookies_file(self, cookies_content, filename):
         """Guarda cookies en un archivo temporal"""
         cookies_path = os.path.join(self.cookies_dir, filename)
@@ -247,12 +122,15 @@ class YTDLPExtractor:
         """Prepara opciones de yt-dlp con cookies y headers"""
         opts = self.base_ydl_opts.copy()
         
+        # Agregar cookies desde archivo
         if cookies_file and os.path.exists(cookies_file):
             opts['cookiefile'] = cookies_file
         
+        # Agregar headers personalizados
         if headers:
             opts['http_headers'] = headers
         
+        # Si tenemos cookies como diccionario, las convertimos a archivo
         if cookies_dict:
             cookies_content = self.dict_to_netscape_cookies(cookies_dict)
             temp_file = f"temp_cookies_{int(time.time())}.txt"
@@ -265,6 +143,7 @@ class YTDLPExtractor:
         """Convierte diccionario de cookies a formato Netscape"""
         lines = ["# Netscape HTTP Cookie File"]
         for name, value in cookies_dict.items():
+            # Formato: domain, domain_specified, path, secure, expires, name, value
             line = f".example.com\tTRUE\t/\tFALSE\t0\t{name}\t{value}"
             lines.append(line)
         return '\n'.join(lines)
@@ -272,14 +151,15 @@ class YTDLPExtractor:
     def extract_info(self, url, extract_formats=True, cookies_file=None, cookies_dict=None, headers=None):
         """Extrae información del video usando yt-dlp o pCloud"""
         try:
+            # Verificar si es un enlace de pCloud
             if self.is_pcloud_link(url):
-                # Para pCloud, intentar ambos métodos
-                try:
-                    return self.extract_pcloud_m3u8_with_proxy(url)
-                except:
-                    # Fallback al método de API
-                    return self.extract_pcloud_direct_link_method(url)
+                hls_formats, basic_info = self.extract_pcloud_m3u8(url)
+                # Simular estructura de yt-dlp
+                info = basic_info.copy()
+                info['formats'] = hls_formats
+                return info
             
+            # Usar yt-dlp para otros sitios
             opts = self.prepare_ydl_opts(cookies_file, cookies_dict, headers)
             if not extract_formats:
                 opts['extract_flat'] = True
@@ -291,28 +171,21 @@ class YTDLPExtractor:
         except Exception as e:
             raise Exception(f"Error extracting info: {str(e)}")
     
-    def get_hls_urls(self, url, cookies_file=None, cookies_dict=None, headers=None, client_ip=None, user_agent=None):
+    def get_hls_urls(self, url, cookies_file=None, cookies_dict=None, headers=None):
         """Extrae URLs HLS específicamente"""
         try:
+            # Para pCloud, usar método específico
             if self.is_pcloud_link(url):
-                # Método optimizado para pCloud con IP del cliente
-                try:
-                    hls_formats, basic_info = self.extract_pcloud_m3u8_with_proxy(url, client_ip, user_agent)
-                    return hls_formats, basic_info
-                except Exception as e:
-                    # Fallback: intentar método de API
-                    try:
-                        direct_formats, basic_info = self.extract_pcloud_direct_link_method(url)
-                        return direct_formats, basic_info
-                    except:
-                        raise e  # Re-lanzar el error original
+                hls_formats, basic_info = self.extract_pcloud_m3u8(url)
+                return hls_formats, basic_info
             
-            # Para otros sitios
+            # Para otros sitios, usar yt-dlp
             info = self.extract_info(url, cookies_file=cookies_file, cookies_dict=cookies_dict, headers=headers)
             hls_formats = []
             
             if 'formats' in info:
                 for fmt in info['formats']:
+                    # Buscar formatos HLS
                     if fmt.get('protocol') == 'm3u8' or fmt.get('protocol') == 'm3u8_native':
                         hls_formats.append({
                             'format_id': fmt.get('format_id'),
@@ -322,10 +195,12 @@ class YTDLPExtractor:
                             'height': fmt.get('height'),
                             'width': fmt.get('width'),
                             'fps': fmt.get('fps'),
-                            'tbr': fmt.get('tbr'),
+                            'tbr': fmt.get('tbr'),  # Total bitrate
                             'protocol': fmt.get('protocol'),
                             'format_note': fmt.get('format_note')
                         })
+                    
+                    # También buscar URLs que contengan .m3u8
                     elif fmt.get('url') and '.m3u8' in fmt.get('url', ''):
                         hls_formats.append({
                             'format_id': fmt.get('format_id'),
@@ -345,14 +220,15 @@ class YTDLPExtractor:
         except Exception as e:
             raise Exception(f"Error getting HLS URLs: {str(e)}")
     
-    def get_best_hls(self, url, cookies_file=None, cookies_dict=None, headers=None, client_ip=None, user_agent=None):
+    def get_best_hls(self, url, cookies_file=None, cookies_dict=None, headers=None):
         """Obtiene la mejor calidad HLS disponible"""
         try:
-            hls_formats, info = self.get_hls_urls(url, cookies_file, cookies_dict, headers, client_ip, user_agent)
+            hls_formats, info = self.get_hls_urls(url, cookies_file, cookies_dict, headers)
             
             if not hls_formats:
                 return None, info
             
+            # Ordenar por calidad (height y tbr)
             best_format = max(hls_formats, key=lambda x: (
                 x.get('height', 0),
                 x.get('tbr', 0)
@@ -361,20 +237,32 @@ class YTDLPExtractor:
             return best_format, info
         except Exception as e:
             raise Exception(f"Error getting best HLS: {str(e)}")
+    
+    def get_supported_sites(self):
+        """Lista sitios soportados por yt-dlp + pCloud"""
+        try:
+            with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+                extractors = ydl.list_extractors()
+                sites = [extractor.IE_NAME for extractor in extractors if hasattr(extractor, 'IE_NAME')]
+                # Agregar pCloud a la lista
+                sites.append('pCloud')
+                return sites
+        except Exception as e:
+            return ['pCloud']  # Al menos devolver pCloud si falla
 
 @app.route('/extract', methods=['POST'])
 def extract_hls():
-    """Extrae URLs HLS de un video (optimizado para pCloud con mínimo bandwidth)"""
+    """Extrae URLs HLS de un video (incluyendo pCloud)"""
     try:
         data = request.json
         url = data.get('url')
         best_only = data.get('best_only', False)
         
         # Opciones de autenticación
-        cookies_file = data.get('cookies_file')
-        cookies_dict = data.get('cookies')
-        headers = data.get('headers')
-        cookies_content = data.get('cookies_content')
+        cookies_file = data.get('cookies_file')  # Ruta al archivo de cookies
+        cookies_dict = data.get('cookies')       # Diccionario de cookies
+        headers = data.get('headers')            # Headers personalizados
+        cookies_content = data.get('cookies_content')  # Contenido directo del archivo
         
         if not url:
             return jsonify({'error': 'URL is required'}), 400
@@ -382,22 +270,20 @@ def extract_hls():
         extractor = YTDLPExtractor()
         temp_cookies_file = None
         
-        # Obtener IP del cliente y User-Agent
-        client_ip = extractor.get_client_ip(request)
-        user_agent = request.headers.get('User-Agent')
-        
         try:
+            # Si se envió contenido de cookies, crear archivo temporal
             if cookies_content:
                 temp_file = f"uploaded_cookies_{int(time.time())}.txt"
                 temp_cookies_file = extractor.save_cookies_file(cookies_content, temp_file)
                 cookies_file = temp_cookies_file
             
             if best_only:
-                best_format, info = extractor.get_best_hls(url, cookies_file, cookies_dict, headers, client_ip, user_agent)
+                best_format, info = extractor.get_best_hls(url, cookies_file, cookies_dict, headers)
                 hls_formats = [best_format] if best_format else []
             else:
-                hls_formats, info = extractor.get_hls_urls(url, cookies_file, cookies_dict, headers, client_ip, user_agent)
+                hls_formats, info = extractor.get_hls_urls(url, cookies_file, cookies_dict, headers)
             
+            # Detectar si es pCloud
             is_pcloud = extractor.is_pcloud_link(url)
             
             return jsonify({
@@ -412,133 +298,238 @@ def extract_hls():
                 'used_cookies': bool(cookies_file or cookies_dict),
                 'used_headers': bool(headers),
                 'source': 'pcloud' if is_pcloud else 'yt-dlp',
-                'is_pcloud': is_pcloud,
-                'client_ip': client_ip,
-                'bandwidth_usage': 'minimal',  # Solo HTML/JSON, no contenido de video
-                'notes': info.get('expires_info') if is_pcloud else None
+                'is_pcloud': is_pcloud
             })
         
         finally:
+            # Limpiar archivo temporal de cookies
             if temp_cookies_file and os.path.exists(temp_cookies_file):
                 os.remove(temp_cookies_file)
     
     except Exception as e:
-        return jsonify({
-            'error': str(e),
-            'suggestion': 'For pCloud links, the URL may require access from the same IP that generated the link'
-        }), 500
+        return jsonify({'error': str(e)}), 500
 
-# Nuevo endpoint específico para pCloud con opciones avanzadas
-@app.route('/extract-pcloud', methods=['POST'])
-def extract_pcloud_advanced():
-    """Endpoint específico para pCloud con múltiples métodos de extracción"""
+    
+
+@app.route('/formats', methods=['POST'])
+def get_all_formats():
+    """Obtiene todos los formatos disponibles (incluyendo pCloud)"""
     try:
         data = request.json
         url = data.get('url')
-        method = data.get('method', 'auto')  # 'auto', 'hls', 'direct'
+        filter_protocol = data.get('protocol')  # 'm3u8', 'http', etc.
+        
+        if not url:
+            return jsonify({'error': 'URL is required'}), 400
+        
+        extractor = YTDLPExtractor()
+        info = extractor.extract_info(url)
+        
+        formats = []
+        if 'formats' in info:
+            for fmt in info['formats']:
+                format_info = {
+                    'format_id': fmt.get('format_id'),
+                    'url': fmt.get('url'),
+                    'ext': fmt.get('ext'),
+                    'protocol': fmt.get('protocol'),
+                    'quality': fmt.get('quality'),
+                    'height': fmt.get('height'),
+                    'width': fmt.get('width'),
+                    'fps': fmt.get('fps'),
+                    'tbr': fmt.get('tbr'),
+                    'abr': fmt.get('abr'),
+                    'vbr': fmt.get('vbr'),
+                    'format_note': fmt.get('format_note'),
+                    'filesize': fmt.get('filesize'),
+                    'language': fmt.get('language'),
+                    'referer': fmt.get('referer'),
+                    'expires': fmt.get('expires'),
+                    'host': fmt.get('host'),
+                    'source': fmt.get('source')
+                }
+                
+                # Filtrar por protocolo si se especifica
+                if filter_protocol:
+                    if fmt.get('protocol') == filter_protocol:
+                        formats.append(format_info)
+                else:
+                    formats.append(format_info)
+        
+        # Detectar si es pCloud
+        is_pcloud = extractor.is_pcloud_link(url)
+        
+        return jsonify({
+            'success': True,
+            'url': url,
+            'title': info.get('title'),
+            'formats_count': len(formats),
+            'formats': formats,
+            'is_pcloud': is_pcloud
+        })
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/download', methods=['POST'])
+def download_video():
+    """Descarga el video (opcional) - No soportado para pCloud"""
+    try:
+        data = request.json
+        url = data.get('url')
+        format_id = data.get('format_id', 'best')
+        output_path = data.get('output_path', './downloads')
         
         if not url:
             return jsonify({'error': 'URL is required'}), 400
         
         extractor = YTDLPExtractor()
         
-        if not extractor.is_pcloud_link(url):
-            return jsonify({'error': 'This endpoint is only for pCloud links'}), 400
-        
-        client_ip = extractor.get_client_ip(request)
-        user_agent = request.headers.get('User-Agent')
-        
-        results = {}
-        
-        if method in ['auto', 'hls']:
-            try:
-                hls_formats, hls_info = extractor.extract_pcloud_m3u8_with_proxy(url, client_ip, user_agent)
-                results['hls_method'] = {
-                    'success': True,
-                    'formats': hls_formats,
-                    'info': hls_info
-                }
-            except Exception as e:
-                results['hls_method'] = {
-                    'success': False,
-                    'error': str(e)
-                }
-        
-        if method in ['auto', 'direct']:
-            try:
-                direct_formats, direct_info = extractor.extract_pcloud_direct_link_method(url)
-                results['direct_method'] = {
-                    'success': True,
-                    'formats': direct_formats,
-                    'info': direct_info
-                }
-            except Exception as e:
-                results['direct_method'] = {
-                    'success': False,
-                    'error': str(e)
-                }
-        
-        # Determinar el mejor resultado
-        if results.get('hls_method', {}).get('success'):
-            best_result = results['hls_method']
-            used_method = 'hls'
-        elif results.get('direct_method', {}).get('success'):
-            best_result = results['direct_method']
-            used_method = 'direct'
-        else:
+        # Verificar si es pCloud
+        if extractor.is_pcloud_link(url):
             return jsonify({
-                'success': False,
-                'error': 'All extraction methods failed',
-                'details': results,
-                'client_ip': client_ip
-            }), 500
+                'error': 'Download not supported for pCloud links. Use the HLS URL directly with your video player.'
+            }), 400
         
+        # Crear directorio si no existe
+        os.makedirs(output_path, exist_ok=True)
+        
+        ydl_opts = {
+            'format': format_id,
+            'outtmpl': f'{output_path}/%(title)s.%(ext)s'
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            
         return jsonify({
             'success': True,
-            'url': url,
-            'method_used': used_method,
-            'title': best_result['info'].get('title'),
-            'formats': best_result['formats'],
-            'formats_count': len(best_result['formats']),
-            'all_methods': results,
-            'client_ip': client_ip,
-            'bandwidth_usage': 'minimal'
+            'title': info.get('title'),
+            'downloaded': True,
+            'output_path': output_path
         })
     
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# ... resto de endpoints sin cambios ...
+@app.route('/upload-cookies', methods=['POST'])
+def upload_cookies():
+    """Sube un archivo de cookies para usar posteriormente"""
+    try:
+        if 'cookies_file' not in request.files:
+            return jsonify({'error': 'No cookies file provided'}), 400
+        
+        file = request.files['cookies_file']
+        if file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+        
+        # Guardar archivo de cookies
+        filename = f"cookies_{int(time.time())}_{file.filename}"
+        cookies_path = os.path.join('./cookies', filename)
+        file.save(cookies_path)
+        
+        return jsonify({
+            'success': True,
+            'cookies_id': filename,
+            'message': 'Cookies file uploaded successfully',
+            'path': cookies_path
+        })
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/cookies/<cookies_id>', methods=['DELETE'])
+def delete_cookies(cookies_id):
+    """Elimina un archivo de cookies"""
+    try:
+        cookies_path = os.path.join('./cookies', cookies_id)
+        if os.path.exists(cookies_path):
+            os.remove(cookies_path)
+            return jsonify({
+                'success': True,
+                'message': 'Cookies file deleted successfully'
+            })
+        else:
+            return jsonify({'error': 'Cookies file not found'}), 404
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/cookies', methods=['GET'])
+def list_cookies():
+    """Lista archivos de cookies disponibles"""
+    try:
+        cookies_files = []
+        if os.path.exists('./cookies'):
+            for filename in os.listdir('./cookies'):
+                if filename.endswith('.txt'):
+                    file_path = os.path.join('./cookies', filename)
+                    file_stats = os.stat(file_path)
+                    cookies_files.append({
+                        'id': filename,
+                        'size': file_stats.st_size,
+                        'created': file_stats.st_ctime,
+                        'modified': file_stats.st_mtime
+                    })
+        
+        return jsonify({
+            'success': True,
+            'cookies_files': cookies_files,
+            'count': len(cookies_files)
+        })
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({
-        'message': 'yt-dlp HLS Extractor API - Optimized for minimal bandwidth usage',
+        'message': 'yt-dlp HLS Extractor API with Cookies Support + pCloud',
         'endpoints': {
-            'POST /extract': 'Extract HLS URLs from video (optimized for pCloud)',
-            'POST /extract-pcloud': 'pCloud-specific extraction with multiple methods',
-            'POST /formats': 'Get all available formats',
-            'POST /download': 'Download video (not recommended for bandwidth conservation)',
+            'POST /extract': 'Extract HLS URLs from video (supports pCloud)',
+            'POST /formats': 'Get all available formats (supports pCloud)',
+            'POST /download': 'Download video (not supported for pCloud)',
+            'POST /upload-cookies': 'Upload cookies file',
+            'GET /cookies': 'List uploaded cookies files',
+            'DELETE /cookies/<id>': 'Delete cookies file',
         },
-        'pcloud_optimizations': {
-            'ip_forwarding': 'Uses client IP to bypass IP restrictions',
-            'minimal_bandwidth': 'Only downloads HTML/JSON metadata, not video content',
-            'multiple_methods': 'HLS extraction and direct API methods',
-            'verification': 'HEAD requests to verify URL accessibility'
+        'supported_sources': [
+            'All yt-dlp supported sites (YouTube, Vimeo, etc.)',
+            'pCloud (u.pcloud.link/publink/show)'
+        ],
+        'cookie_options': {
+            'cookies_file': 'Path to local cookies file',
+            'cookies': 'Dictionary of cookies {name: value}',
+            'cookies_content': 'Raw cookies file content',
+            'headers': 'Custom HTTP headers'
         },
-        'bandwidth_usage': {
-            'extract': '< 50KB per request (only metadata)',
-            'verify_urls': '< 1KB per URL (HEAD requests)',
-            'no_video_download': 'Zero video content bandwidth usage'
-        },
-        'pcloud_tips': [
-            'URLs work best when accessed from same IP that generated the link',
-            'HLS URLs may expire after some time',
-            'Direct download URLs bypass some IP restrictions',
-            'Always use the client\'s IP for extraction when possible'
-        ]
+        'examples': {
+            'pcloud_extract': {
+                'url': 'POST /extract',
+                'body': {
+                    'url': 'https://u.pcloud.link/publink/show?code=XZ6v9u5ZkMmXtlVDhV4Veuz5zGduOj1DIVik',
+                    'best_only': True
+                }
+            },
+            'extract_with_cookies_dict': {
+                'url': 'POST /extract',
+                'body': {
+                    'url': 'https://example.com/video',
+                    'best_only': True,
+                    'cookies': {
+                        'session_id': 'abc123',
+                        'auth_token': 'xyz789'
+                    },
+                    'headers': {
+                        'User-Agent': 'Custom User Agent',
+                        'Referer': 'https://example.com'
+                    }
+                }
+            }
+        }
     })
 
 if __name__ == '__main__':
+    # Puerto flexible para Railway
     port = int(os.environ.get('PORT', 5000))
     app.run(debug=False, host='0.0.0.0', port=port, threaded=True)

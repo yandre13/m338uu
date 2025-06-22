@@ -1,25 +1,5 @@
-# Core Flask dependencies
 Flask==2.3.3
-Flask-CORS==4.0.0
-
-# Video extraction
-yt-dlp==2023.9.24
-
-# HTTP requests
-requests==2.31.0
-
-# Standard library modules (included with Python)
-# json - built-in
-# re - built-in
-# urllib.parse - built-in
-# tempfile - built-in
-# os - built-in
-# time - built-in
-# hashlib - built-in
-
-# Optional: For better performance and compatibility
-Werkzeug==2.3.7
+flask-cors==4.0.0
+yt-dlp==2023.12.30
 gunicorn==21.2.0
-
-# Optional: For deployment
-python-dotenv==1.0.0
+requests==2.31.0
