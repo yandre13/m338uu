@@ -33,84 +33,151 @@ class YTDLPExtractor:
         return "u.pcloud.link/publink/show" in url
     
     def extract_pcloud_m3u8(self, pcloud_url):
-        """Extrae la URL del m3u8 desde pCloud"""
+    """Extrae la URL del m3u8 desde pCloud con manejo de IP"""
+    try:
+        # Crear una sesión para mantener cookies
+        session = requests.Session()
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Cache-Control': 'max-age=0'
+        }
+        
+        # Paso 1: Obtener el servidor API
         try:
-            # 1. Hacer request al enlace de pCloud
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1'
-            }
+            api_response = session.get('https://api.pcloud.com/getapiserver', 
+                                     headers=headers, timeout=10)
+            if api_response.status_code == 200:
+                api_data = api_response.json()
+                api_server = api_data.get('api', [])
+                if api_server:
+                    print(f"API Server: {api_server[0]}")
+        except:
+            pass  # Continuar aunque falle
+        
+        # Paso 2: Verificar cookies (opcional, puede fallar)
+        try:
+            cookie_check = session.get('https://my.pcloud.com/checkcookie?names=pcauth,locationid',
+                                     headers=headers, timeout=10)
+        except:
+            pass  # No es crítico
+        
+        # Paso 3: Acceder al enlace principal
+        response = session.get(pcloud_url, headers=headers, timeout=30)
+        
+        # Si obtenemos error de IP, intentar con diferentes headers
+        if "generated for another IP address" in response.text:
+            # Intentar con headers diferentes
+            headers.update({
+                'X-Forwarded-For': '8.8.8.8',  # IP pública de Google
+                'X-Real-IP': '8.8.8.8',
+                'CF-Connecting-IP': '8.8.8.8'
+            })
             
-            response = requests.get(pcloud_url, headers=headers, timeout=30)
-            response.raise_for_status()
+            # Nuevo intento
+            response = session.get(pcloud_url, headers=headers, timeout=30)
             
-            # 2. Extraer el JSON con la info del video
-            json_pattern = r'var publinkData = ({.*?});'
-            json_match = re.search(json_pattern, response.text, re.DOTALL)
+            # Si sigue fallando, intentar con proxy headers
+            if "generated for another IP address" in response.text:
+                headers.update({
+                    'Via': '1.1 8.8.8.8',
+                    'X-Forwarded-Proto': 'https',
+                    'X-Forwarded-Host': 'u.pcloud.link'
+                })
+                response = session.get(pcloud_url, headers=headers, timeout=30)
+        
+        response.raise_for_status()
+        
+        # Verificar si aún hay error de IP
+        if "generated for another IP address" in response.text:
+            raise Exception("pCloud link is IP-restricted. Try accessing the link from your browser first, or use a different method.")
+        
+        # Resto del código igual...
+        json_pattern = r'var publinkData = ({.*?});'
+        json_match = re.search(json_pattern, response.text, re.DOTALL)
+        
+        if not json_match:
+            # Buscar patrones alternativos
+            alt_patterns = [
+                r'window\.publinkData = ({.*?});',
+                r'publinkData = ({.*?});',
+                r'"publinkData":\s*({.*?})',
+            ]
+            
+            for pattern in alt_patterns:
+                json_match = re.search(pattern, response.text, re.DOTALL)
+                if json_match:
+                    break
             
             if not json_match:
                 raise Exception("No se pudo extraer publinkData del HTML")
-            
-            # 3. Parsear el JSON
-            data = json.loads(json_match.group(1))
-            
-            # 4. Buscar la variante HLS (m3u8)
-            variants = data.get('variants', [])
-            hls_formats = []
-            
-            for variant in variants:
-                if variant.get('transcodetype') == 'hls':
-                    path = variant['path']
-                    hosts = variant.get('hosts', [])
+        
+        # Parsear el JSON
+        data = json.loads(json_match.group(1))
+        
+        # Buscar la variante HLS (m3u8)
+        variants = data.get('variants', [])
+        hls_formats = []
+        
+        for variant in variants:
+            if variant.get('transcodetype') == 'hls':
+                path = variant['path']
+                hosts = variant.get('hosts', [])
+                
+                if hosts:
+                    host = hosts[0]
+                    m3u8_url = f"https://{host}{path}"
                     
-                    if hosts:
-                        host = hosts[0]  # Tomar el primer host
-                        m3u8_url = f"https://{host}{path}"
-                        
-                        hls_format = {
-                            'format_id': f"pcloud_hls_{variant.get('id', 'unknown')}",
-                            'url': m3u8_url,
-                            'ext': 'm3u8',
-                            'protocol': 'm3u8_native',
-                            'height': variant.get('height'),
-                            'width': variant.get('width'),
-                            'fps': variant.get('fps'),
-                            'tbr': variant.get('bitrate'),
-                            'format_note': f"pCloud HLS {variant.get('height', 'unknown')}p",
-                            'referer': pcloud_url,
-                            'expires': variant.get('expires'),
-                            'host': host,
-                            'source': 'pcloud'
-                        }
-                        hls_formats.append(hls_format)
-            
-            if not hls_formats:
-                raise Exception("No se encontraron variantes HLS en los datos de pCloud")
-            
-            # Información básica del archivo
-            basic_info = {
-                'title': data.get('name', 'pCloud Video'),
-                'duration': data.get('duration'),
-                'filesize': data.get('size'),
-                'thumbnail': data.get('thumb1024', data.get('thumb', '')),
-                'uploader': 'pCloud',
-                'webpage_url': pcloud_url,
-                'source': 'pcloud'
-            }
-            
-            return hls_formats, basic_info
-            
-        except requests.RequestException as e:
-            raise Exception(f"Error al acceder a pCloud: {str(e)}")
-        except json.JSONDecodeError as e:
-            raise Exception(f"Error al parsear JSON de pCloud: {str(e)}")
-        except Exception as e:
-            raise Exception(f"Error procesando pCloud: {str(e)}")
-    
+                    hls_format = {
+                        'format_id': f"pcloud_hls_{variant.get('id', 'unknown')}",
+                        'url': m3u8_url,
+                        'ext': 'm3u8',
+                        'protocol': 'm3u8_native',
+                        'height': variant.get('height'),
+                        'width': variant.get('width'),
+                        'fps': variant.get('fps'),
+                        'tbr': variant.get('bitrate'),
+                        'format_note': f"pCloud HLS {variant.get('height', 'unknown')}p",
+                        'referer': pcloud_url,
+                        'expires': variant.get('expires'),
+                        'host': host,
+                        'source': 'pcloud'
+                    }
+                    hls_formats.append(hls_format)
+        
+        if not hls_formats:
+            raise Exception("No se encontraron variantes HLS en los datos de pCloud")
+        
+        # Información básica del archivo
+        basic_info = {
+            'title': data.get('name', 'pCloud Video'),
+            'duration': data.get('duration'),
+            'filesize': data.get('size'),
+            'thumbnail': data.get('thumb1024', data.get('thumb', '')),
+            'uploader': 'pCloud',
+            'webpage_url': pcloud_url,
+            'source': 'pcloud'
+        }
+        
+        return hls_formats, basic_info
+        
+    except requests.RequestException as e:
+        raise Exception(f"Error al acceder a pCloud: {str(e)}")
+    except json.JSONDecodeError as e:
+        raise Exception(f"Error al parsear JSON de pCloud: {str(e)}")
+    except Exception as e:
+        raise Exception(f"Error procesando pCloud: {str(e)}")
+
+        
     def save_cookies_file(self, cookies_content, filename):
         """Guarda cookies en un archivo temporal"""
         cookies_path = os.path.join(self.cookies_dir, filename)
